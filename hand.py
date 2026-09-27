@@ -1,135 +1,112 @@
 import cv2
+import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-# --- CONFIGURATION ---
-MODEL_PATH = "hand_landmarker.task"  # Make sure this file is in your folder!
+MODEL_PATH = "hand_landmarker.task"
 
-# Helper to draw landmarks (The Tasks API doesn't bundle drawing styles anymore, 
-# so we draw lines and points using basic OpenCV functions)
-# A complete hardcoded list mapping hand joint connections (replacing mp_hands.HAND_CONNECTIONS)
-HAND_CONNECTIONS = [
-    # Thumb
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    # Index finger
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    # Middle finger
-    (9, 10), (10, 11), (11, 12),
-    # Ring finger
-    (13, 14), (14, 15), (15, 16),
+# Index mappings for calculating finger joint angles (Prev, Joint, Next)
+ANGLE_DEFINITIONS = [
+    # Thumb: Base, Middle, Tip
+    (0, 1, 2), (1, 2, 3), (2, 3, 4),
+    # Index: Knuckle, Middle, Lower Tip
+    (5, 6, 7), (6, 7, 8), (0, 5, 6),
+    # Middle
+    (9, 10, 11), (10, 11, 12), (0, 9, 10),
+    # Ring
+    (13, 14, 15), (14, 15, 16), (0, 13, 14),
     # Pinky
-    (0, 17), (17, 18), (18, 19), (19, 20),
-    # Knuckle connections (Palm baseline)
-    (5, 9), (9, 13), (13, 17)
+    (17, 18, 19), (18, 19, 20), (0, 17, 18)
 ]
 
-def draw_landmarks_on_image(rgb_image, detection_result):
-    hand_landmarks_list = detection_result.hand_landmarks
-    annotated_image = rgb_image.copy()
-    h, w, _ = rgb_image.shape
+def calculate_3d_angle(p_prev, p_joint, p_next):
+    a = np.array([p_prev.x, p_prev.y, p_prev.z])
+    b = np.array([p_joint.x, p_joint.y, p_joint.z])
+    c = np.array([p_next.x, p_next.y, p_next.z])
+    
+    ba = a - b
+    bc = c - b
+    
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+    return np.degrees(np.arccos(cosine_angle))
 
-    for hand_landmarks in hand_landmarks_list:
-        # Convert landmarks from normalized coordinates to actual pixel coordinates
-        pixel_points = []
-        for lm in hand_landmarks:
-            cx, cy = int(lm.x * w), int(lm.y * h)
-            pixel_points.append((cx, cy))
+def extract_rl_state(latest_result):
+    """
+    Outputs a flat state vector of size 30: 
+    [15 angles Left Hand, 15 angles Right Hand].
+    Missing hands are padded with zeros to preserve shape.
+    """
+    state_vector = np.zeros(30, dtype=np.float32)
+    
+    if latest_result is None or not latest_result.hand_world_landmarks:
+        return state_vector
 
-        # 1. First draw the skeleton lines connecting the joints
-        for connection in HAND_CONNECTIONS:
-            start_idx, end_idx = connection
-            cv2.line(annotated_image, pixel_points[start_idx], pixel_points[end_idx], (255, 0, 0), 2) # Blue lines
-
-        # 2. Then draw the joint marker circles on top
-        for point in pixel_points:
-            cv2.circle(annotated_image, point, 5, (0, 255, 0), -1) # Green markers
+    # Parse what hands were detected
+    for idx, handedness in enumerate(latest_result.handedness):
+        hand_label = handedness[0].category_name # "Left" or "Right"
+        world_landmarks = latest_result.hand_world_landmarks[idx]
+        
+        # Calculate the 14 defined angles for this hand
+        hand_angles = []
+        for prev_i, joint_i, next_i in ANGLE_DEFINITIONS:
+            angle = calculate_3d_angle(
+                world_landmarks[prev_i], 
+                world_landmarks[joint_i], 
+                world_landmarks[next_i]
+            )
+            hand_angles.append(angle)
             
-    return annotated_image
+        # Place hand data in designated slots inside the vector
+        if hand_label == "Left":
+            state_vector[0:15] = hand_angles
+        elif hand_label == "Right":
+            state_vector[15:30] = hand_angles
+            
+    return state_vector
 
+def main():
+    # --- Live Feed Loop ---
+    cap = cv2.VideoCapture(0)
+    latest_result = None
 
-# ==========================================
-# PART 1: STATIC IMAGES
-# ==========================================
-IMAGE_FILES = []  # Add your image paths here if needed
+    def async_callback(result: vision.HandLandmarkerResult, output_image: mp.Image, timestamp_ms: int):
+        nonlocal latest_result
+        latest_result = result
 
-if IMAGE_FILES:
-    # Configure options for static images
     base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.HandLandmarkerOptions(
         base_options=base_options,
-        running_mode=vision.RunningMode.IMAGE,
-        num_hands=2
+        running_mode=vision.RunningMode.LIVE_STREAM,
+        num_hands=2,
+        result_callback=async_callback
     )
 
     with vision.HandLandmarker.create_from_options(options) as landmarker:
-        for idx, file in enumerate(IMAGE_FILES):
-            image = cv2.flip(cv2.imread(file), 1)
-            # Convert BGR to RGB
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            # MediaPipe Tasks requires its own Image wrapper object
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success: continue
+
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+            timestamp = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
+            landmarker.detect_async(mp_image, timestamp)
+
+            # Construct your state vector
+            rl_observation_space = extract_rl_state(latest_result)
             
-            # Process the image
-            detection_result = landmarker.detect(mp_image)
-            
-            # Draw and save results
-            if detection_result.hand_landmarks:
-                print('Handedness:', detection_result.handedness)
-                annotated_image = draw_landmarks_on_image(rgb_image, detection_result)
-                # Convert back to BGR for saving
-                bgr_annotated = cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(f'/tmp/annotated_image{idx}.png', cv2.flip(bgr_annotated, 1))
+            # --- SEND TO YOUR AGENT HERE ---
+            # Example: agent.step(rl_observation_space)
+            # For testing, we print the array shape and a subset of the angles
+            print(f"RL State Vector Shape: {rl_observation_space.shape} | Sample Angle: {rl_observation_space[0]:.1f}°")
 
-# ==========================================
-# PART 2: WEBCAM INPUT (LIVE STREAM MODE)
-# ==========================================
-cap = cv2.VideoCapture(0)
+            cv2.imshow('RL Observation Stream', frame)
+            if cv2.waitKey(1) & 0xFF == 27: 
+                break
 
-# Configure options for Live Streaming. 
-# Live stream mode requires a callback function to handle async results.
-latest_result = None
+    cap.release()
+    cv2.destroyAllWindows()
 
-def save_result(result: vision.HandLandmarkerResult, output_image: mp.Image, timestamp_ms: int):
-    global latest_result
-    latest_result = result
-
-base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
-options = vision.HandLandmarkerOptions(
-    base_options=base_options,
-    running_mode=vision.RunningMode.LIVE_STREAM,
-    num_hands=2,
-    result_callback=save_result
-)
-
-with vision.HandLandmarker.create_from_options(options) as landmarker:
-    while cap.isOpened():
-        success, image = cap.read()
-        if not success:
-            print("Ignoring empty camera frame.")
-            continue
-
-        # Convert to RGB
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-        
-        # Get system timestamp in milliseconds (Required for live stream mode)
-        frame_timestamp_ms = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
-        
-        # Send frame to the landmarker asynchronously
-        landmarker.detect_async(mp_image, frame_timestamp_ms)
-
-        # Draw the latest available results
-        display_image = image
-        if latest_result is not None and latest_result.hand_landmarks:
-            annotated_rgb = draw_landmarks_on_image(rgb_image, latest_result)
-            display_image = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
-
-        # Flip horizontally for selfie-view
-        cv2.imshow('MediaPipe Tasks Hands', cv2.flip(display_image, 1))
-        
-        if cv2.waitKey(5) & 0xFF == 27:  # Press 'ESC' to exit
-            break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == '__main__':
+    main()
